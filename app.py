@@ -1,112 +1,101 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from scipy.stats import poisson
 
-# Set page layout
-st.set_page_config(page_title="AI Match Predictor", layout="wide")
-st.title("⚽ AI Match Predictor")
-
-# 1. Load Data
-@st.cache_data
-def load_data():
-    df = pd.read_csv("historical_data.csv")
-    return df
-
-try:
-    df = load_data()
-except Exception as e:
-    st.error("Could not load 'historical_data.csv'. Make sure the CSV file is uploaded to your GitHub repository.")
-    st.stop()
-
-# 2. Sidebar Controls
-st.sidebar.header("Match Setup")
-teams = sorted(df['HomeTeam'].unique()) if 'HomeTeam' in df.columns else []
-
-if not teams:
-    st.error("Column 'HomeTeam' not found in dataset. Please check your CSV column names.")
-    st.stop()
-
-home_team = st.sidebar.selectbox("Home Team", teams, index=0)
-away_team = st.sidebar.selectbox("Away Team", teams, index=min(1, len(teams)-1))
-
-# 3. Model Logic (Poisson Expectation Engine)
 def predict_match(df, home, away):
-    # Overall averages
-    avg_home_goals = df['FTHG'].mean() if 'FTHG' in df.columns else df['HG'].mean()
-    avg_away_goals = df['FTAG'].mean() if 'FTAG' in df.columns else df['AG'].mean()
-    
-    # Team stats
-    home_scored = df[df['HomeTeam'] == home]['FTHG' if 'FTHG' in df.columns else 'HG'].mean()
-    home_conceded = df[df['HomeTeam'] == home]['FTAG' if 'FTAG' in df.columns else 'AG'].mean()
-    
-    away_scored = df[df['AwayTeam'] == away]['FTAG' if 'FTAG' in df.columns else 'AG'].mean()
-    away_conceded = df[df['AwayTeam'] == away]['HomeTeam' if 'HomeTeam' in df.columns else 'HG'].mean()
-    
-    # Strengths
-    home_att = home_scored / avg_home_goals if avg_home_goals else 1.0
-    home_def = home_conceded / avg_away_goals if avg_away_goals else 1.0
-    away_att = away_scored / avg_away_goals if avg_away_goals else 1.0
-    away_def = away_conceded / avg_home_goals if avg_home_goals else 1.0
-    
-    # Expected goals (lambda)
-    exp_home_goals = home_att * away_def * avg_home_goals
-    exp_away_goals = away_att * home_def * avg_away_goals
-    
-    # Score matrix (0 to 5 goals)
+    """
+    Calculates expected goals and match outcome probabilities using Poisson distribution.
+    """
+    # 1. Identify goal column names dynamically
+    h_goals_col = 'FTHG' if 'FTHG' in df.columns else 'HG'
+    a_goals_col = 'FTAG' if 'FTAG' in df.columns else 'AG'
+
+    # 2. Convert goal columns to numeric values (replaces invalid text/strings with NaN)
+    df[h_goals_col] = pd.to_numeric(df[h_goals_col], errors='coerce')
+    df[a_goals_col] = pd.to_numeric(df[a_goals_col], errors='coerce')
+
+    # 3. Calculate average goals scored and conceded
+    home_scored = df[df['HomeTeam'] == home][h_goals_col].mean()
+    home_conceded = df[df['HomeTeam'] == home][a_goals_col].mean()
+
+    away_scored = df[df['AwayTeam'] == away][a_goals_col].mean()
+    away_conceded = df[df['AwayTeam'] == away][h_goals_col].mean() # Corrected from HomeTeam name
+
+    # 4. League averages for relative attack/defense strengths
+    avg_home_scored = df[h_goals_col].mean()
+    avg_away_scored = df[a_goals_col].mean()
+
+    # Fallback safety in case of division by zero or missing data
+    if pd.isna(home_scored) or pd.isna(away_conceded) or avg_home_scored == 0:
+        expected_home_goals = 1.0
+    else:
+        home_attack = home_scored / avg_home_scored
+        away_defense = away_conceded / avg_home_scored
+        expected_home_goals = home_attack * away_defense * avg_home_scored
+
+    if pd.isna(away_scored) or pd.isna(home_conceded) or avg_away_scored == 0:
+        expected_away_goals = 1.0
+    else:
+        away_attack = away_scored / avg_away_scored
+        home_defense = home_conceded / avg_away_scored
+        expected_away_goals = away_attack * home_defense * avg_away_scored
+
+    # 5. Calculate Poisson probability score matrix (0-5 goals)
     max_goals = 6
     p_matrix = np.zeros((max_goals, max_goals))
     for h in range(max_goals):
         for a in range(max_goals):
-            p_matrix[h, a] = poisson.pmf(h, exp_home_goals) * poisson.pmf(a, exp_away_goals)
-            
-    p_matrix /= p_matrix.sum() # Normalize
-    
-    home_win = np.sum(np.tril(p_matrix, -1))
-    draw = np.sum(np.diag(p_matrix))
-    away_win = np.sum(np.triu(p_matrix, 1))
-    
-    return [home_win, draw, away_win], p_matrix
+            p_matrix[h, a] = poisson.pmf(h, expected_home_goals) * poisson.pmf(a, expected_away_goals)
 
-# 4. Main Display
-if st.sidebar.button("Generate Prediction", type="primary"):
-    if home_team == away_team:
-        st.warning("Please select two different teams.")
+    # 6. Aggregate outcomes
+    home_win_prob = float(np.sum(np.tril(p_matrix, -1)))
+    draw_prob = float(np.sum(np.diag(p_matrix)))
+    away_win_prob = float(np.sum(np.triu(p_matrix, 1)))
+
+    probs = {
+        'Home Win': home_win_prob,
+        'Draw': draw_prob,
+        'Away Win': away_win_prob,
+        'Expected Home Goals': expected_home_goals,
+        'Expected Away Goals': expected_away_goals
+    }
+
+    return probs, p_matrix
+
+
+# --- Streamlit App Setup ---
+st.title("FootyScore AI")
+
+# Upload dataset or load default
+uploaded_file = st.file_uploader("Upload Football Data (CSV)", type=["csv"])
+
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+
+    # Validate mandatory columns
+    required_cols = ['HomeTeam', 'AwayTeam']
+    if all(col in df.columns for col in required_cols):
+        
+        teams = sorted(df['HomeTeam'].dropna().unique())
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            home_team = st.selectbox("Select Home Team", teams)
+        with col2:
+            away_team = st.selectbox("Select Away Team", [t for t in teams if t != home_team])
+
+        if st.button("Predict Match"):
+            # Line 78 execution
+            probs, p_matrix = predict_match(df, home_team, away_team)
+
+            st.subheader(f"Prediction: {home_team} vs {away_team}")
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Home Win", f"{probs['Home Win'] * 100:.1f}%")
+            c2.metric("Draw", f"{probs['Draw'] * 100:.1f}%")
+            c3.metric("Away Win", f"{probs['Away Win'] * 100:.1f}%")
+
+            st.write(f"**Expected Goals:** {home_team} ({probs['Expected Home Goals']:.2f}) - ({probs['Expected Away Goals']:.2f}) {away_team}")
     else:
-        probs, p_matrix = predict_match(df, home_team, away_team)
-        
-        st.subheader(f"{home_team} vs {away_team}")
-        
-        # Key Metrics Display
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Home Win", f"{probs[0]*100:.1f}%")
-        col2.metric("Draw", f"{probs[1]*100:.1f}%")
-        col3.metric("Away Win", f"{probs[2]*100:.1f}%")
-        
-        # Visualization Plot
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # Bar Chart
-        categories = ['Home Win', 'Draw', 'Away Win']
-        colors = ['#2ecc71', '#95a5a6', '#e74c3c']
-        bars = ax1.barh(categories, probs, color=colors)
-        ax1.set_xlim(0, 1.0)
-        ax1.set_title("Match Probabilities", fontsize=14)
-        for bar in bars:
-            width = bar.get_width()
-            ax1.text(width + 0.02, bar.get_y() + bar.get_height()/2, f"{width*100:.1f}%", va='center')
-        ax1.invert_yaxis()
-        
-        # Heatmap
-        sns.heatmap(p_matrix * 100, annot=True, fmt=".1f", cmap="YlGnBu", 
-                    xticklabels=range(6), yticklabels=range(6), ax=ax2, cbar=False)
-        ax2.set_title("Exact Scoreline Probabilities (%)", fontsize=14)
-        ax2.set_xlabel(f"{away_team} Goals")
-        ax2.set_ylabel(f"{home_team} Goals")
-        
-        plt.tight_layout()
-        st.pyplot(fig)
-else:
-    st.info("Select teams in the sidebar and click 'Generate Prediction' to run the model.")
+        st.error("CSV must contain 'HomeTeam' and 'AwayTeam' columns.")
