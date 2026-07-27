@@ -96,7 +96,6 @@ def predict_match(df, home, away):
         draw_prob /= total_p
         away_win_prob /= total_p
 
-    # Find highest probability score in matrix
     max_score_idx = np.unravel_index(np.argmax(p_matrix, axis=None), p_matrix.shape)
     top_home_g, top_away_g = max_score_idx[0], max_score_idx[1]
     top_score_prob = p_matrix[top_home_g, top_away_g] * 100
@@ -112,6 +111,7 @@ def predict_match(df, home, away):
     }, p_matrix
 
 def get_h2h_matches(df, team1, team2):
+    """Filters data for the last 2 direct encounters between team1 and team2."""
     h2h = df[
         ((df['HomeTeam'] == team1) & (df['AwayTeam'] == team2)) |
         ((df['HomeTeam'] == team2) & (df['AwayTeam'] == team1))
@@ -131,9 +131,11 @@ def get_h2h_matches(df, team1, team2):
     h2h['Score'] = h2h[h_col].astype(str) + ' - ' + h2h[a_col].astype(str)
     display_cols = [c for c in ['Date', 'HomeTeam', 'Score', 'AwayTeam'] if c in h2h.columns]
 
-    return h2h[display_cols].head(5)
+    # Return only the last 2 matches
+    return h2h[display_cols].head(2)
 
 def display_player_predictions(player_df, team_name, expected_team_goals):
+    """Calculates individual player scoring/assisting chances and identifies Star Player."""
     if player_df is not None and not player_df.empty:
         try:
             df = player_df.copy()
@@ -165,6 +167,14 @@ def display_player_predictions(player_df, team_name, expected_team_goals):
                 else:
                     team_players['Assist Prob (%)'] = 0.0
 
+                # Determine Star Player (highest combined goal involvement)
+                team_players['Star_Score'] = team_players['Goal Prob (%)'] + (team_players['Assist Prob (%)'] * 0.5)
+                star_row = team_players.sort_values(by='Star_Score', ascending=False).iloc[0]
+                star_name = star_row[player_col]
+                star_goal_prob = star_row['Goal Prob (%)']
+
+                st.markdown(f"⭐ **Star Player:** **{star_name}** ({star_goal_prob:.1f}% goal prob)")
+
                 top_scorers = team_players[[player_col, 'Goal Prob (%)', 'Assist Prob (%)']].sort_values(by='Goal Prob (%)', ascending=False).head(5)
                 top_scorers.columns = ['Player', 'Scoring Prob (%)', 'Assist Prob (%)']
                 
@@ -173,6 +183,8 @@ def display_player_predictions(player_df, team_name, expected_team_goals):
         except Exception:
             pass
 
+    # Fallback Star Player & Targets estimation
+    st.markdown("⭐ **Star Player:** **Main Forward / Striker**")
     st.caption("*(Estimated distribution based on expected team goals)*")
     fallback_data = [
         {"Player": "Main Forward / Striker", "Scoring Prob (%)": min(expected_team_goals * 38.0, 85.0), "Assist Prob (%)": min(expected_team_goals * 18.0, 50.0)},
@@ -209,14 +221,13 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
         c2.metric("Draw", f"{probs['Draw'] * 100:.1f}%")
         c3.metric("Away Win", f"{probs['Away Win'] * 100:.1f}%")
 
-        # Highlight Most Likely Score & Expected Goals
         st.success(f"🎯 **Most Likely Score:** {home_team} **{probs['Top Score']}** {away_team} ({probs['Top Score Prob']:.1f}% probability)")
         st.info(f"**Expected Goals:** {home_team} ({probs['Expected Home Goals']:.2f}) - ({probs['Expected Away Goals']:.2f}) {away_team}")
 
         st.divider()
 
-        # Head to Head
-        st.write("### 📜 Head-to-Head (Last 5 Meetings)")
+        # Head to Head (Last 2 Meetings)
+        st.write("### 📜 Head-to-Head (Last 2 Meetings)")
         h2h_df = get_h2h_matches(df, home_team, away_team)
         if h2h_df is not None and not h2h_df.empty:
             st.dataframe(h2h_df, use_container_width=True, hide_index=True)
@@ -225,20 +236,20 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
 
         st.divider()
 
-        # Player Predictions via FBref
-        st.write("### 👟 Player Goalscorer & Assist Predictions")
+        # Player Predictions & Star Player Highlights
+        st.write("### 👟 Key Player Predictions")
         sd_code = LEAGUES_CONFIG[selected_league]["sd_code"]
         
-        with st.spinner("Fetching player FBref data..."):
+        with st.spinner("Fetching player data..."):
             player_df = load_player_stats(sd_code)
 
         col_h, col_a = st.columns(2)
         with col_h:
-            st.write(f"**{home_team} Key Targets**")
+            st.write(f"**{home_team} Targets**")
             display_player_predictions(player_df, home_team, probs['Expected Home Goals'])
             
         with col_a:
-            st.write(f"**{away_team} Key Targets**")
+            st.write(f"**{away_team} Targets**")
             display_player_predictions(player_df, away_team, probs['Expected Away Goals'])
 
         st.divider()
