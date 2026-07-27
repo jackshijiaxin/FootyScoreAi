@@ -1,8 +1,8 @@
 streamlit
 pandas
 numpy
-scikit-learn
-lightgbm
 scipy
 matplotlib
 seaborn
+soccerdata
+html5lib
