@@ -12,13 +12,28 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas requests
+
       - name: Download Latest Premier League Match CSV
         run: |
           curl -o historical_data.csv https://www.football-data.co.uk/mmz4281/2526/E0.csv
+
+      - name: Fetch and Build Player Data CSV
+        env:
+          FOOTBALL_API_KEY: ${{ secrets.FOOTBALL_API_KEY }}
+        run: |
+          python update_players.py
 
       - name: Commit and Push Updated Data
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add historical_data.csv
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update historical match data" && git push)
+          git add historical_data.csv players_data.csv
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update historical match & player data" && git push)
