@@ -1,13 +1,21 @@
 import os
+import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.stats import poisson
 import matplotlib.pyplot as plt
 import seaborn as sns
-import soccerdata as sd
 
 st.set_page_config(page_title="FootyScore AI", layout="centered")
+
+# --- API Configuration ---
+# Retrieves key from Streamlit Secrets or fallback variable
+API_KEY = st.secrets.get("FOOTBALL_API_KEY", "YOUR_API_KEY_HERE")
+API_HOST = "v3.football.api-sports.io"
+HEADERS = {
+    "x-apisports-key": API_KEY
+}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE_PATH = os.path.join(BASE_DIR, "historical_data.csv")
@@ -15,29 +23,29 @@ CSV_FILE_PATH = os.path.join(BASE_DIR, "historical_data.csv")
 LEAGUES_CONFIG = {
     "English Premier League": {
         "match_url": "https://www.football-data.co.uk/mmz4281/2425/E0.csv",
-        "sd_code": "ENG-Premier League"
+        "api_league_id": 39
     },
     "Spanish La Liga": {
         "match_url": "https://www.football-data.co.uk/mmz4281/2425/SP1.csv",
-        "sd_code": "ESP-La Liga"
+        "api_league_id": 140
     },
     "Italian Serie A": {
         "match_url": "https://www.football-data.co.uk/mmz4281/2425/I1.csv",
-        "sd_code": "ITA-Serie A"
+        "api_league_id": 135
     },
     "German Bundesliga": {
         "match_url": "https://www.football-data.co.uk/mmz4281/2425/D1.csv",
-        "sd_code": "GER-Bundesliga"
+        "api_league_id": 78
     },
     "French Ligue 1": {
         "match_url": "https://www.football-data.co.uk/mmz4281/2425/F1.csv",
-        "sd_code": "FRA-Ligue 1"
+        "api_league_id": 61
     }
 }
 
 @st.cache_data(ttl="1d")
 def load_match_data(league_name):
-    """Loads historical team match data for the specific league."""
+    """Loads historical team match data for the selected league."""
     url = LEAGUES_CONFIG[league_name]["match_url"]
     try:
         df_league = pd.read_csv(url)
@@ -46,21 +54,62 @@ def load_match_data(league_name):
     except Exception:
         pass
 
-    # Fallback to local file if offline or URL fetch fails
     if os.path.exists(CSV_FILE_PATH):
         return pd.read_csv(CSV_FILE_PATH)
     return None
 
 @st.cache_data(ttl=86400)
-def load_player_stats(sd_code):
-    """Fetches FBref player stats via soccerdata for top 5 leagues."""
+def fetch_api_team_players(team_name, league_id):
+    """Fetches real player stats directly from API-Football."""
+    if API_KEY == "e191d485e320e7b7b1ecbc8fe00a578c":
+        return None
+
     try:
-        fbref = sd.FBref(leagues=sd_code, seasons="2425")
-        df_players = fbref.read_player_season_stats(stat_type="standard")
-        if df_players is not None and not df_players.empty:
-            return df_players.reset_index()
+        # 1. Get Team ID
+        search_url = f"https://{API_HOST}/teams"
+        params_team = {"search": team_name}
+        res_team = requests.get(search_url, headers=HEADERS, params=params_team, timeout=10).json()
+
+        if not res_team.get("response"):
+            return None
+
+        team_id = res_team["response"][0]["team"]["id"]
+
+        # 2. Get Player Stats for Team
+        players_url = f"https://{API_HOST}/players"
+        params_players = {"team": team_id, "season": 2024, "league": league_id}
+        res_players = requests.get(players_url, headers=HEADERS, params=params_players, timeout=10).json()
+
+        player_list = []
+        for item in res_players.get("response", []):
+            player_info = item["player"]
+            stats = item["statistics"][0]
+
+            games_played = stats["games"].get("appearences") or 0
+            if games_played < 3:
+                continue
+
+            raw_rating = stats["games"].get("rating")
+            rating = float(raw_rating) if raw_rating else 6.5
+
+            goals = stats["goals"].get("total") or 0
+            assists = stats["goals"].get("assists") or 0
+            position = stats["games"].get("position") or "Attacker"
+
+            player_list.append({
+                "Player": player_info["name"],
+                "Position": position,
+                "Goals": goals,
+                "Assists": assists,
+                "Rating": round(rating, 2)
+            })
+
+        if player_list:
+            return pd.DataFrame(player_list)
+
     except Exception:
         pass
+
     return None
 
 def predict_match(df, home, away):
@@ -134,67 +183,44 @@ def get_h2h_matches(df, team1, team2):
 
     return h2h[display_cols].head(2)
 
-def display_player_predictions(player_df, team_name, expected_team_goals):
-    """Calculates individual player scoring/assisting chances and identifies Star Player."""
+def display_player_predictions(team_name, league_id, expected_team_goals):
+    """Fetches and displays real players with exact match ratings and goal probabilities."""
+    player_df = fetch_api_team_players(team_name, league_id)
+
     if player_df is not None and not player_df.empty:
-        try:
-            df = player_df.copy()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = ['_'.join([str(c) for c in col if str(c) != '']).strip() for col in df.columns]
+        # Calculate goal & assist probabilities based on real player data
+        total_goals = player_df["Goals"].sum()
+        total_assists = player_df["Assists"].sum()
 
-            team_col = [c for c in df.columns if 'team' in c.lower() or 'squad' in c.lower()][0]
-            player_col = [c for c in df.columns if 'player' in c.lower()][0]
-            xg_col = [c for c in df.columns if 'xg' in c.lower() and 'per' not in c.lower() and 'assist' not in c.lower()][0]
-            xa_col = [c for c in df.columns if 'xg_assist' in c.lower() or 'xa' in c.lower() or 'ast' in c.lower()][0]
+        if total_goals > 0:
+            player_df['Scoring Prob (%)'] = (1 - np.exp(-(player_df['Goals'] / total_goals) * expected_team_goals)) * 100
+        else:
+            player_df['Scoring Prob (%)'] = 0.0
 
-            team_players = df[df[team_col].astype(str).str.contains(team_name, case=False, na=False)].copy()
+        if total_assists > 0:
+            player_df['Assist Prob (%)'] = (1 - np.exp(-(player_df['Assists'] / total_assists) * expected_team_goals)) * 100
+        else:
+            player_df['Assist Prob (%)'] = 0.0
 
-            if not team_players.empty:
-                team_players[xg_col] = pd.to_numeric(team_players[xg_col], errors='coerce').fillna(0)
-                team_players[xa_col] = pd.to_numeric(team_players[xa_col], errors='coerce').fillna(0)
+        # Highest rated player overall gets Star Player title
+        star_player = player_df.sort_values(by="Rating", ascending=False).iloc[0]
+        st.markdown(f"⭐ **Star Player:** **{star_player['Player']}** ({star_player['Position']} - Avg Rating: **{star_player['Rating']}/10**)")
 
-                total_team_xg = team_players[xg_col].sum()
-                if total_team_xg > 0:
-                    team_players['Match_xG'] = (team_players[xg_col] / total_team_xg) * expected_team_goals
-                    team_players['Goal Prob (%)'] = (1 - np.exp(-team_players['Match_xG'])) * 100
-                else:
-                    team_players['Goal Prob (%)'] = 0.0
+        # Display Top 5 key attackers/playmakers
+        top_targets = player_df.sort_values(by="Rating", ascending=False).head(5)
+        display_df = top_targets[["Player", "Position", "Scoring Prob (%)", "Assist Prob (%)"]]
 
-                total_team_xa = team_players[xa_col].sum()
-                if total_team_xa > 0:
-                    team_players['Match_xA'] = (team_players[xa_col] / total_team_xa) * expected_team_goals
-                    team_players['Assist Prob (%)'] = (1 - np.exp(-team_players['Match_xA'])) * 100
-                else:
-                    team_players['Assist Prob (%)'] = 0.0
+        st.dataframe(
+            display_df.style.format({'Scoring Prob (%)': '{:.1f}%', 'Assist Prob (%)': '{:.1f}%'}),
+            hide_index=True
+        )
+        return
 
-                team_players['Star_Score'] = team_players['Goal Prob (%)'] + (team_players['Assist Prob (%)'] * 0.5)
-                star_row = team_players.sort_values(by='Star_Score', ascending=False).iloc[0]
-                star_name = star_row[player_col]
-                star_goal_prob = star_row['Goal Prob (%)']
-
-                st.markdown(f"⭐ **Star Player:** **{star_name}** ({star_goal_prob:.1f}% goal prob)")
-
-                top_scorers = team_players[[player_col, 'Goal Prob (%)', 'Assist Prob (%)']].sort_values(by='Goal Prob (%)', ascending=False).head(5)
-                top_scorers.columns = ['Player', 'Scoring Prob (%)', 'Assist Prob (%)']
-                
-                st.dataframe(top_scorers.style.format({'Scoring Prob (%)': '{:.1f}%', 'Assist Prob (%)': '{:.1f}%'}), hide_index=True)
-                return
-        except Exception:
-            pass
-
-    st.markdown("⭐ **Star Player:** **Main Forward / Striker**")
-    st.caption("*(Estimated distribution based on expected team goals)*")
-    fallback_data = [
-        {"Player": "Main Forward / Striker", "Scoring Prob (%)": min(expected_team_goals * 38.0, 85.0), "Assist Prob (%)": min(expected_team_goals * 18.0, 50.0)},
-        {"Player": "Left Winger / Inside Forward", "Scoring Prob (%)": min(expected_team_goals * 26.0, 70.0), "Assist Prob (%)": min(expected_team_goals * 22.0, 55.0)},
-        {"Player": "Right Winger", "Scoring Prob (%)": min(expected_team_goals * 24.0, 68.0), "Assist Prob (%)": min(expected_team_goals * 25.0, 60.0)},
-        {"Player": "Attacking Midfielder", "Scoring Prob (%)": min(expected_team_goals * 16.0, 45.0), "Assist Prob (%)": min(expected_team_goals * 30.0, 65.0)},
-        {"Player": "Central Midfielder", "Scoring Prob (%)": min(expected_team_goals * 10.0, 30.0), "Assist Prob (%)": min(expected_team_goals * 15.0, 40.0)},
-    ]
-    st.dataframe(pd.DataFrame(fallback_data).style.format({'Scoring Prob (%)': '{:.1f}%', 'Assist Prob (%)': '{:.1f}%'}), hide_index=True)
+    # Fallback message if API key isn't provided or request limit reached
+    st.info("💡 Add your API-Football Key to load real player names & live ratings.")
 
 
-# --- Interface ---
+# --- Streamlit UI ---
 st.title("⚽ FootyScore AI")
 
 selected_league = st.selectbox("Select League", list(LEAGUES_CONFIG.keys()))
@@ -234,21 +260,19 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
 
         st.divider()
 
-        # Player Predictions & Star Player Highlights
-        st.write("### 👟 Key Player Predictions")
-        sd_code = LEAGUES_CONFIG[selected_league]["sd_code"]
-        
-        with st.spinner("Fetching player data..."):
-            player_df = load_player_stats(sd_code)
+        # Real Player Predictions via API-Football
+        st.write("### 👟 Key Player Predictions & Star Players")
+        league_id = LEAGUES_CONFIG[selected_league]["api_league_id"]
 
-        col_h, col_a = st.columns(2)
-        with col_h:
-            st.write(f"**{home_team} Targets**")
-            display_player_predictions(player_df, home_team, probs['Expected Home Goals'])
-            
-        with col_a:
-            st.write(f"**{away_team} Targets**")
-            display_player_predictions(player_df, away_team, probs['Expected Away Goals'])
+        with st.spinner("Fetching real player ratings from API-Football..."):
+            col_h, col_a = st.columns(2)
+            with col_h:
+                st.write(f"**{home_team} Targets**")
+                display_player_predictions(home_team, league_id, probs['Expected Home Goals'])
+                
+            with col_a:
+                st.write(f"**{away_team} Targets**")
+                display_player_predictions(away_team, league_id, probs['Expected Away Goals'])
 
         st.divider()
 
