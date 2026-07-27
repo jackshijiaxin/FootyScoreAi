@@ -37,18 +37,19 @@ LEAGUES_CONFIG = {
 
 @st.cache_data(ttl="1d")
 def load_match_data(league_name):
-    """Loads historical team match data."""
-    if os.path.exists(CSV_FILE_PATH):
-        local_df = pd.read_csv(CSV_FILE_PATH)
-        if 'League' in local_df.columns:
-            filtered = local_df[local_df['League'] == league_name]
-            if not filtered.empty:
-                return filtered
-        else:
-            return local_df
-    
+    """Loads historical team match data for the specific league."""
     url = LEAGUES_CONFIG[league_name]["match_url"]
-    return pd.read_csv(url)
+    try:
+        df_league = pd.read_csv(url)
+        if df_league is not None and not df_league.empty:
+            return df_league
+    except Exception:
+        pass
+
+    # Fallback to local file if offline or URL fetch fails
+    if os.path.exists(CSV_FILE_PATH):
+        return pd.read_csv(CSV_FILE_PATH)
+    return None
 
 @st.cache_data(ttl=86400)
 def load_player_stats(sd_code):
@@ -131,7 +132,6 @@ def get_h2h_matches(df, team1, team2):
     h2h['Score'] = h2h[h_col].astype(str) + ' - ' + h2h[a_col].astype(str)
     display_cols = [c for c in ['Date', 'HomeTeam', 'Score', 'AwayTeam'] if c in h2h.columns]
 
-    # Return only the last 2 matches
     return h2h[display_cols].head(2)
 
 def display_player_predictions(player_df, team_name, expected_team_goals):
@@ -167,7 +167,6 @@ def display_player_predictions(player_df, team_name, expected_team_goals):
                 else:
                     team_players['Assist Prob (%)'] = 0.0
 
-                # Determine Star Player (highest combined goal involvement)
                 team_players['Star_Score'] = team_players['Goal Prob (%)'] + (team_players['Assist Prob (%)'] * 0.5)
                 star_row = team_players.sort_values(by='Star_Score', ascending=False).iloc[0]
                 star_name = star_row[player_col]
@@ -183,7 +182,6 @@ def display_player_predictions(player_df, team_name, expected_team_goals):
         except Exception:
             pass
 
-    # Fallback Star Player & Targets estimation
     st.markdown("⭐ **Star Player:** **Main Forward / Striker**")
     st.caption("*(Estimated distribution based on expected team goals)*")
     fallback_data = [
