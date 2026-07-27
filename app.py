@@ -35,7 +35,7 @@ LEAGUES_CONFIG = {
     }
 }
 
-@st.cache_data
+@st.cache_data(ttl="1d")
 def load_match_data(league_name):
     """Loads historical team match data."""
     if os.path.exists(CSV_FILE_PATH):
@@ -44,6 +44,8 @@ def load_match_data(league_name):
             filtered = local_df[local_df['League'] == league_name]
             if not filtered.empty:
                 return filtered
+        else:
+            return local_df
     
     url = LEAGUES_CONFIG[league_name]["match_url"]
     return pd.read_csv(url)
@@ -55,9 +57,8 @@ def load_player_stats(sd_code):
         fbref = sd.FBref(leagues=sd_code, seasons="2425")
         df_players = fbref.read_player_season_stats(stat_type="standard")
         if df_players is not None and not df_players.empty:
-            # Flatten MultiIndex index to columns
             return df_players.reset_index()
-    except Exception as e:
+    except Exception:
         pass
     return None
 
@@ -95,12 +96,19 @@ def predict_match(df, home, away):
         draw_prob /= total_p
         away_win_prob /= total_p
 
+    # Find highest probability score in matrix
+    max_score_idx = np.unravel_index(np.argmax(p_matrix, axis=None), p_matrix.shape)
+    top_home_g, top_away_g = max_score_idx[0], max_score_idx[1]
+    top_score_prob = p_matrix[top_home_g, top_away_g] * 100
+
     return {
         'Home Win': home_win_prob,
         'Draw': draw_prob,
         'Away Win': away_win_prob,
         'Expected Home Goals': expected_home_goals,
-        'Expected Away Goals': expected_away_goals
+        'Expected Away Goals': expected_away_goals,
+        'Top Score': f"{top_home_g} - {top_away_g}",
+        'Top Score Prob': top_score_prob
     }, p_matrix
 
 def get_h2h_matches(df, team1, team2):
@@ -126,21 +134,17 @@ def get_h2h_matches(df, team1, team2):
     return h2h[display_cols].head(5)
 
 def display_player_predictions(player_df, team_name, expected_team_goals):
-    """Calculates individual player scoring/assisting chances."""
     if player_df is not None and not player_df.empty:
         try:
-            # Flatten column tuple names if MultiIndex columns exist
             df = player_df.copy()
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = ['_'.join([str(c) for c in col if str(c) != '']).strip() for col in df.columns]
 
-            # Locate relevant columns
             team_col = [c for c in df.columns if 'team' in c.lower() or 'squad' in c.lower()][0]
             player_col = [c for c in df.columns if 'player' in c.lower()][0]
             xg_col = [c for c in df.columns if 'xg' in c.lower() and 'per' not in c.lower() and 'assist' not in c.lower()][0]
             xa_col = [c for c in df.columns if 'xg_assist' in c.lower() or 'xa' in c.lower() or 'ast' in c.lower()][0]
 
-            # Fuzzy team name filter (e.g. "Arsenal" matches "Arsenal FC" or "Arsenal")
             team_players = df[df[team_col].astype(str).str.contains(team_name, case=False, na=False)].copy()
 
             if not team_players.empty:
@@ -169,7 +173,6 @@ def display_player_predictions(player_df, team_name, expected_team_goals):
         except Exception:
             pass
 
-    # Fallback player estimate if FBref blocks request or data unavailable
     st.caption("*(Estimated distribution based on expected team goals)*")
     fallback_data = [
         {"Player": "Main Forward / Striker", "Scoring Prob (%)": min(expected_team_goals * 38.0, 85.0), "Assist Prob (%)": min(expected_team_goals * 18.0, 50.0)},
@@ -206,6 +209,8 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
         c2.metric("Draw", f"{probs['Draw'] * 100:.1f}%")
         c3.metric("Away Win", f"{probs['Away Win'] * 100:.1f}%")
 
+        # Highlight Most Likely Score & Expected Goals
+        st.success(f"🎯 **Most Likely Score:** {home_team} **{probs['Top Score']}** {away_team} ({probs['Top Score Prob']:.1f}% probability)")
         st.info(f"**Expected Goals:** {home_team} ({probs['Expected Home Goals']:.2f}) - ({probs['Expected Away Goals']:.2f}) {away_team}")
 
         st.divider()
