@@ -5,34 +5,65 @@ import numpy as np
 from scipy.stats import poisson
 import matplotlib.pyplot as plt
 import seaborn as sns
+import soccerdata as sd
 
 st.set_page_config(page_title="FootyScore AI", layout="centered")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE_PATH = os.path.join(BASE_DIR, "historical_data.csv")
 
-# Direct links to top 5 league data from Football-Data.co.uk
-LEAGUE_URLS = {
-    "English Premier League": "https://www.football-data.co.uk/mmz4281/2324/E0.csv",
-    "Spanish La Liga": "https://www.football-data.co.uk/mmz4281/2324/SP1.csv",
-    "Italian Serie A": "https://www.football-data.co.uk/mmz4281/2324/I1.csv",
-    "German Bundesliga": "https://www.football-data.co.uk/mmz4281/2324/D1.csv",
-    "French Ligue 1": "https://www.football-data.co.uk/mmz4281/2324/F1.csv"
+# Top 5 Leagues Mapping for both Match Data and SoccerData (FBref)
+LEAGUES_CONFIG = {
+    "English Premier League": {
+        "match_url": "https://www.football-data.co.uk/mmz4281/2425/E0.csv",
+        "sd_code": "ENG-Premier League"
+    },
+    "Spanish La Liga": {
+        "match_url": "https://www.football-data.co.uk/mmz4281/2425/SP1.csv",
+        "sd_code": "ESP-La Liga"
+    },
+    "Italian Serie A": {
+        "match_url": "https://www.football-data.co.uk/mmz4281/2425/I1.csv",
+        "sd_code": "ITA-Serie A"
+    },
+    "German Bundesliga": {
+        "match_url": "https://www.football-data.co.uk/mmz4281/2425/D1.csv",
+        "sd_code": "GER-Bundesliga"
+    },
+    "French Ligue 1": {
+        "match_url": "https://www.football-data.co.uk/mmz4281/2425/F1.csv",
+        "sd_code": "FRA-Ligue 1"
+    }
 }
 
 @st.cache_data
-def load_data(league_name):
-    # Check if local file exists and has a 'League' column
+def load_match_data(league_name):
+    """Loads historical team match data."""
     if os.path.exists(CSV_FILE_PATH):
         local_df = pd.read_csv(CSV_FILE_PATH)
         if 'League' in local_df.columns:
-            return local_df[local_df['League'] == league_name]
+            filtered = local_df[local_df['League'] == league_name]
+            if not filtered.empty:
+                return filtered
     
-    # Fallback: Download league directly from web
-    url = LEAGUE_URLS.get(league_name)
-    if url:
-        return pd.read_csv(url)
-    return None
+    url = LEAGUES_CONFIG[league_name]["match_url"]
+    return pd.read_csv(url)
+
+@st.cache_data(ttl=86400)
+def load_player_stats(sd_code, season="2526"):
+    """Fetches FBref player stats via soccerdata for top 5 leagues."""
+    try:
+        fbref = sd.FBref(leagues=sd_code, seasons=season)
+        # Fetch standard season stats (Goals, Assists, xG, xA)
+        df_players = fbref.read_player_season_stats(stat_type="standard")
+        return df_players
+    except Exception as e:
+        # Fallback to previous season if 2526 data isn't initialized yet
+        try:
+            fbref = sd.FBref(leagues=sd_code, seasons="2425")
+            return fbref.read_player_season_stats(stat_type="standard")
+        except Exception:
+            return None
 
 def predict_match(df, home, away):
     h_goals_col = 'FTHG' if 'FTHG' in df.columns else 'HG'
@@ -76,12 +107,85 @@ def predict_match(df, home, away):
         'Expected Away Goals': expected_away_goals
     }, p_matrix
 
+def get_h2h_matches(df, team1, team2):
+    h2h = df[
+        ((df['HomeTeam'] == team1) & (df['AwayTeam'] == team2)) |
+        ((df['HomeTeam'] == team2) & (df['AwayTeam'] == team1))
+    ].copy()
+
+    if h2h.empty:
+        return None
+
+    h_col = 'FTHG' if 'FTHG' in h2h.columns else 'HG'
+    a_col = 'FTAG' if 'FTAG' in h2h.columns else 'AG'
+
+    if 'Date' in h2h.columns:
+        h2h['Date'] = pd.to_datetime(h2h['Date'], dayfirst=True, errors='coerce')
+        h2h = h2h.sort_values(by='Date', ascending=False)
+        h2h['Date'] = h2h['Date'].dt.strftime('%Y-%m-%d')
+
+    h2h['Score'] = h2h[h_col].astype(str) + ' - ' + h2h[a_col].astype(str)
+    display_cols = [c for c in ['Date', 'HomeTeam', 'Score', 'AwayTeam'] if c in h2h.columns]
+
+    return h2h[display_cols].head(5)
+
+def display_player_predictions(player_df, team_name, expected_team_goals):
+    """Calculates individual player scoring/assisting chances based on FBref xG/xA."""
+    if player_df is None or player_df.empty:
+        st.write("Player data unavailable.")
+        return
+
+    try:
+        # Reset MultiIndex columns if returned by soccerdata
+        if isinstance(player_df.columns, pd.MultiIndex):
+            player_df.columns = ['_'.join(col).strip() for col in player_df.columns.values]
+
+        # Find columns matching player, team, and expected stats
+        team_col = [c for c in player_df.columns if 'team' in c.lower() or 'squad' in c.lower()][0]
+        player_col = [c for c in player_df.columns if 'player' in c.lower()][0]
+        xg_col = [c for c in player_df.columns if 'xg' in c.lower() and 'per' not in c.lower()][0]
+        xa_col = [c for c in player_df.columns if 'xg_assist' in c.lower() or 'xa' in c.lower() or 'ast' in c.lower()][0]
+
+        # Filter for team
+        team_players = player_df[player_df[team_col].astype(str).str.contains(team_name, case=False, na=False)].copy()
+
+        if team_players.empty:
+            st.write(f"No player stats found for {team_name}.")
+            return
+
+        team_players[xg_col] = pd.to_numeric(team_players[xg_col], errors='coerce').fillna(0)
+        team_players[xa_col] = pd.to_numeric(team_players[xa_col], errors='coerce').fillna(0)
+
+        # Scale expected goals/assists by team's expected goals in this match
+        total_team_xg = team_players[xg_col].sum()
+        if total_team_xg > 0:
+            team_players['Match_xG'] = (team_players[xg_col] / total_team_xg) * expected_team_goals
+            # Scoring probability formula: P(scoring >= 1 goal) = 1 - exp(-xG)
+            team_players['Goal Prob (%)'] = (1 - np.exp(-team_players['Match_xG'])) * 100
+        else:
+            team_players['Goal Prob (%)'] = 0.0
+
+        total_team_xa = team_players[xa_col].sum()
+        if total_team_xa > 0:
+            team_players['Match_xA'] = (team_players[xa_col] / total_team_xa) * expected_team_goals
+            team_players['Assist Prob (%)'] = (1 - np.exp(-team_players['Match_xA'])) * 100
+        else:
+            team_players['Assist Prob (%)'] = 0.0
+
+        top_scorers = team_players[[player_col, 'Goal Prob (%)', 'Assist Prob (%)']].sort_values(by='Goal Prob (%)', ascending=False).head(5)
+        top_scorers.columns = ['Player', 'Scoring Prob (%)', 'Assist Prob (%)']
+
+        st.dataframe(top_scorers.style.format({'Scoring Prob (%)': '{:.1f}%', 'Assist Prob (%)': '{:.1f}%'}), hide_index=True)
+
+    except Exception as e:
+        st.write("Could not parse player stats table.")
+
+
 # --- App Interface ---
 st.title("⚽ FootyScore AI")
 
-# League Selector
-selected_league = st.selectbox("Select League", list(LEAGUE_URLS.keys()))
-df = load_data(selected_league)
+selected_league = st.selectbox("Select League", list(LEAGUES_CONFIG.keys()))
+df = load_match_data(selected_league)
 
 if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
     teams = sorted(df['HomeTeam'].dropna().unique())
@@ -106,7 +210,35 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
 
         st.divider()
 
-        # Score Matrix Heatmap
+        # Head to Head
+        st.write("### 📜 Head-to-Head (Last 5 Meetings)")
+        h2h_df = get_h2h_matches(df, home_team, away_team)
+        if h2h_df is not None and not h2h_df.empty:
+            st.dataframe(h2h_df, use_container_width=True, hide_index=True)
+        else:
+            st.write("No direct Head-to-Head matches found in this dataset.")
+
+        st.divider()
+
+        # Player Predictions via FBref
+        st.write("### 👟 Player Goalscorer & Assist Predictions (FBref)")
+        sd_code = LEAGUES_CONFIG[selected_league]["sd_code"]
+        
+        with st.spinner("Fetching player FBref data..."):
+            player_df = load_player_stats(sd_code)
+
+        col_h, col_a = st.columns(2)
+        with col_h:
+            st.write(f"**{home_team} Top Targets**")
+            display_player_predictions(player_df, home_team, probs['Expected Home Goals'])
+            
+        with col_a:
+            st.write(f"**{away_team} Top Targets**")
+            display_player_predictions(player_df, away_team, probs['Expected Away Goals'])
+
+        st.divider()
+
+        # Visualizations
         st.write("### 📊 Correct Score Matrix Heatmap")
         fig, ax = plt.subplots(figsize=(6, 4))
         sns.heatmap(p_matrix * 100, annot=True, fmt=".1f", cmap="Blues", xticklabels=range(6), yticklabels=range(6), ax=ax)
@@ -114,7 +246,6 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
         ax.set_ylabel(f"{home_team} Goals")
         st.pyplot(fig)
 
-        # Top Outcomes
         st.write("### 🎯 Top 5 Most Likely Outcomes")
         scores = []
         for h in range(6):
