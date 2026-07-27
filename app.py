@@ -10,7 +10,6 @@ import seaborn as sns
 st.set_page_config(page_title="FootyScore AI", layout="centered")
 
 # --- API Configuration ---
-# Retrieves key from Streamlit Secrets or fallback variable
 API_KEY = st.secrets.get("FOOTBALL_API_KEY", "YOUR_API_KEY_HERE")
 API_HOST = "v3.football.api-sports.io"
 HEADERS = {
@@ -60,7 +59,7 @@ def load_match_data(league_name):
 
 @st.cache_data(ttl=86400)
 def fetch_api_team_players(team_name, league_id):
-    """Fetches real player stats directly from API-Football."""
+    """Fetches full team squad stats directly from API-Football."""
     if API_KEY == "YOUR_API_KEY_HERE":
         return None
 
@@ -75,37 +74,44 @@ def fetch_api_team_players(team_name, league_id):
 
         team_id = res_team["response"][0]["team"]["id"]
 
-        # 2. Get Player Stats for Team
-        players_url = f"https://{API_HOST}/players"
-        params_players = {"team": team_id, "season": 2024, "league": league_id}
-        res_players = requests.get(players_url, headers=HEADERS, params=params_players, timeout=10).json()
-
+        # 2. Get Player Stats across multiple pages to cover the whole squad
         player_list = []
-        for item in res_players.get("response", []):
-            player_info = item["player"]
-            stats = item["statistics"][0]
+        for page in range(1, 3):  # Fetch pages 1 and 2 (~40 players)
+            players_url = f"https://{API_HOST}/players"
+            params_players = {"team": team_id, "season": 2024, "league": league_id, "page": page}
+            res_players = requests.get(players_url, headers=HEADERS, params=params_players, timeout=10).json()
 
-            games_played = stats["games"].get("appearences") or 0
-            if games_played < 3:
-                continue
+            items = res_players.get("response", [])
+            if not items:
+                break
 
-            raw_rating = stats["games"].get("rating")
-            rating = float(raw_rating) if raw_rating else 6.5
+            for item in items:
+                player_info = item["player"]
+                stats = item["statistics"][0]
 
-            goals = stats["goals"].get("total") or 0
-            assists = stats["goals"].get("assists") or 0
-            position = stats["games"].get("position") or "Attacker"
+                games_played = stats["games"].get("appearences") or 0
+                position = stats["games"].get("position") or "Attacker"
 
-            player_list.append({
-                "Player": player_info["name"],
-                "Position": position,
-                "Goals": goals,
-                "Assists": assists,
-                "Rating": round(rating, 2)
-            })
+                # Filter out players with fewer than 8 appearances to ignore backup/cup players
+                if games_played < 8:
+                    continue
+
+                raw_rating = stats["games"].get("rating")
+                rating = float(raw_rating) if raw_rating else 6.5
+
+                goals = stats["goals"].get("total") or 0
+                assists = stats["goals"].get("assists") or 0
+
+                player_list.append({
+                    "Player": player_info["name"],
+                    "Position": position,
+                    "Goals": goals,
+                    "Assists": assists,
+                    "Rating": round(rating, 2)
+                })
 
         if player_list:
-            return pd.DataFrame(player_list)
+            return pd.DataFrame(player_list).drop_duplicates(subset=["Player"])
 
     except Exception:
         pass
@@ -184,30 +190,36 @@ def get_h2h_matches(df, team1, team2):
     return h2h[display_cols].head(2)
 
 def display_player_predictions(team_name, league_id, expected_team_goals):
-    """Fetches and displays real players with exact match ratings and goal probabilities."""
+    """Displays real outfield players with accurate ratings and goal probabilities."""
     player_df = fetch_api_team_players(team_name, league_id)
 
     if player_df is not None and not player_df.empty:
-        # Calculate goal & assist probabilities based on real player data
-        total_goals = player_df["Goals"].sum()
-        total_assists = player_df["Assists"].sum()
+        # Filter out Goalkeepers for star player & goal target evaluations
+        outfield_df = player_df[player_df["Position"] != "Goalkeeper"].copy()
+
+        if outfield_df.empty:
+            outfield_df = player_df.copy()
+
+        total_goals = outfield_df["Goals"].sum()
+        total_assists = outfield_df["Assists"].sum()
 
         if total_goals > 0:
-            player_df['Scoring Prob (%)'] = (1 - np.exp(-(player_df['Goals'] / total_goals) * expected_team_goals)) * 100
+            outfield_df['Scoring Prob (%)'] = (1 - np.exp(-(outfield_df['Goals'] / total_goals) * expected_team_goals)) * 100
         else:
-            player_df['Scoring Prob (%)'] = 0.0
+            outfield_df['Scoring Prob (%)'] = 0.0
 
         if total_assists > 0:
-            player_df['Assist Prob (%)'] = (1 - np.exp(-(player_df['Assists'] / total_assists) * expected_team_goals)) * 100
+            outfield_df['Assist Prob (%)'] = (1 - np.exp(-(outfield_df['Assists'] / total_assists) * expected_team_goals)) * 100
         else:
-            player_df['Assist Prob (%)'] = 0.0
+            outfield_df['Assist Prob (%)'] = 0.0
 
-        # Highest rated player overall gets Star Player title
-        star_player = player_df.sort_values(by="Rating", ascending=False).iloc[0]
+        # Highest rated outfield player gets Star Player title
+        star_player = outfield_df.sort_values(by="Rating", ascending=False).iloc[0]
         st.markdown(f"⭐ **Star Player:** **{star_player['Player']}** ({star_player['Position']} - Avg Rating: **{star_player['Rating']}/10**)")
 
-        # Display Top 5 key attackers/playmakers
-        top_targets = player_df.sort_values(by="Rating", ascending=False).head(5)
+        # Display Top 5 attackers/playmakers based on goal contributions and ratings
+        outfield_df["Rank_Score"] = outfield_df["Goals"] * 2 + outfield_df["Assists"] + outfield_df["Rating"]
+        top_targets = outfield_df.sort_values(by="Rank_Score", ascending=False).head(5)
         display_df = top_targets[["Player", "Position", "Scoring Prob (%)", "Assist Prob (%)"]]
 
         st.dataframe(
@@ -216,7 +228,6 @@ def display_player_predictions(team_name, league_id, expected_team_goals):
         )
         return
 
-    # Fallback message if API key isn't provided or request limit reached
     st.info("💡 Add your API-Football Key to load real player names & live ratings.")
 
 
