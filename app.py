@@ -61,7 +61,7 @@ def load_match_data(league_name):
 @st.cache_data(ttl=86400)
 def fetch_api_team_players(team_name, league_id):
     """Fetches real player stats directly from API-Football."""
-    if API_KEY == "e191d485e320e7b7b1ecbc8fe00a578c":
+    if API_KEY == "YOUR_API_KEY_HERE":
         return None
 
     try:
