@@ -9,39 +9,54 @@ import seaborn as sns
 
 st.set_page_config(page_title="FootyScore AI", layout="centered")
 
-# --- API Configuration ---
+# --- API & File Configuration ---
 API_KEY = st.secrets.get("FOOTBALL_API_KEY", "YOUR_API_KEY_HERE")
 API_HOST = "v3.football.api-sports.io"
-HEADERS = {
-    "x-apisports-key": API_KEY
-}
+HEADERS = {"x-apisports-key": API_KEY}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE_PATH = os.path.join(BASE_DIR, "historical_data.csv")
+PLAYERS_CSV_PATH = os.path.join(BASE_DIR, "players_data.csv")
+
+# Team name translation dictionary (football-data.co.uk -> API-Football)
+TEAM_NAME_MAP = {
+    "Ath Bilbao": "Athletic Club",
+    "Ath Madrid": "Atletico Madrid",
+    "Man City": "Manchester City",
+    "Man United": "Manchester United",
+    "Wolves": "Wolverhampton Wanderers",
+    "Nott'm Forest": "Nottingham Forest",
+    "Paris SG": "Paris Saint Germain",
+    "Leverkusen": "Bayer Leverkusen",
+    "Inter": "Inter Milan",
+    "Bayern Munich": "Bayern Munich",
+    "Spurs": "Tottenham Hotspur"
+}
 
 LEAGUES_CONFIG = {
     "English Premier League": {
-        "match_url": "https://www.football-data.co.uk/mmz4281/2425/E0.csv",
+        "match_url": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
         "api_league_id": 39
     },
     "Spanish La Liga": {
-        "match_url": "https://www.football-data.co.uk/mmz4281/2425/SP1.csv",
+        "match_url": "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
         "api_league_id": 140
     },
     "Italian Serie A": {
-        "match_url": "https://www.football-data.co.uk/mmz4281/2425/I1.csv",
+        "match_url": "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
         "api_league_id": 135
     },
     "German Bundesliga": {
-        "match_url": "https://www.football-data.co.uk/mmz4281/2425/D1.csv",
+        "match_url": "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
         "api_league_id": 78
     },
     "French Ligue 1": {
-        "match_url": "https://www.football-data.co.uk/mmz4281/2425/F1.csv",
+        "match_url": "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
         "api_league_id": 61
     }
 }
 
+# --- Data Loaders ---
 @st.cache_data(ttl="1d")
 def load_match_data(league_name):
     """Loads historical team match data for the selected league."""
@@ -57,26 +72,33 @@ def load_match_data(league_name):
         return pd.read_csv(CSV_FILE_PATH)
     return None
 
+@st.cache_data(ttl=3600)
+def load_players_csv():
+    """Reads the pre-built player dataset generated daily by GitHub Actions."""
+    if os.path.exists(PLAYERS_CSV_PATH):
+        return pd.read_csv(PLAYERS_CSV_PATH)
+    return None
+
 @st.cache_data(ttl=86400)
 def fetch_api_team_players(team_name, league_id):
-    """Fetches full team squad stats directly from API-Football."""
-    if API_KEY == "YOUR_API_KEY_HERE":
+    """Fallback: Fetches full team squad directly from API-Football if CSV missing."""
+    if not API_KEY or API_KEY == "YOUR_API_KEY_HERE":
         return None
 
     try:
-        # 1. Get Team ID
+        search_name = TEAM_NAME_MAP.get(team_name, team_name)
         search_url = f"https://{API_HOST}/teams"
-        params_team = {"search": team_name}
+        params_team = {"search": search_name}
         res_team = requests.get(search_url, headers=HEADERS, params=params_team, timeout=10).json()
 
         if not res_team.get("response"):
             return None
 
         team_id = res_team["response"][0]["team"]["id"]
-
-        # 2. Get Player Stats across multiple pages to cover the whole squad
         player_list = []
-        for page in range(1, 3):  # Fetch pages 1 and 2 (~40 players)
+
+        # Loop through pages to get full squad
+        for page in range(1, 3):
             players_url = f"https://{API_HOST}/players"
             params_players = {"team": team_id, "season": 2024, "league": league_id, "page": page}
             res_players = requests.get(players_url, headers=HEADERS, params=params_players, timeout=10).json()
@@ -92,17 +114,16 @@ def fetch_api_team_players(team_name, league_id):
                 games_played = stats["games"].get("appearences") or 0
                 position = stats["games"].get("position") or "Attacker"
 
-                # Filter out players with fewer than 8 appearances to ignore backup/cup players
-                if games_played < 8:
+                if games_played < 5:
                     continue
 
                 raw_rating = stats["games"].get("rating")
                 rating = float(raw_rating) if raw_rating else 6.5
-
                 goals = stats["goals"].get("total") or 0
                 assists = stats["goals"].get("assists") or 0
 
                 player_list.append({
+                    "Team": team_name,
                     "Player": player_info["name"],
                     "Position": position,
                     "Goals": goals,
@@ -118,6 +139,7 @@ def fetch_api_team_players(team_name, league_id):
 
     return None
 
+# --- Match Prediction Logic ---
 def predict_match(df, home, away):
     h_goals_col = 'FTHG' if 'FTHG' in df.columns else 'HG'
     a_goals_col = 'FTAG' if 'FTAG' in df.columns else 'AG'
@@ -190,15 +212,30 @@ def get_h2h_matches(df, team1, team2):
     return h2h[display_cols].head(2)
 
 def display_player_predictions(team_name, league_id, expected_team_goals):
-    """Displays real outfield players with accurate ratings and goal probabilities."""
-    player_df = fetch_api_team_players(team_name, league_id)
+    """Displays key outfield players, probabilities, and star player."""
+    team_df = None
 
-    if player_df is not None and not player_df.empty:
-        # Filter out Goalkeepers for star player & goal target evaluations
-        outfield_df = player_df[player_df["Position"] != "Goalkeeper"].copy()
+    # 1. Attempt to load from daily CSV first
+    players_csv = load_players_csv()
+    if players_csv is not None and not players_csv.empty:
+        mapped_name = TEAM_NAME_MAP.get(team_name, team_name)
+        matched = players_csv[
+            (players_csv["Team"].str.lower() == team_name.lower()) |
+            (players_csv["Team"].str.lower() == mapped_name.lower()) |
+            (players_csv.get("OfficialTeam", pd.Series()).str.lower() == mapped_name.lower())
+        ]
+        if not matched.empty:
+            team_df = matched.copy()
 
+    # 2. Fallback to live API if CSV isn't available
+    if team_df is None or team_df.empty:
+        team_df = fetch_api_team_players(team_name, league_id)
+
+    if team_df is not None and not team_df.empty:
+        # Strictly exclude Goalkeepers from star player & target calculations
+        outfield_df = team_df[team_df["Position"] != "Goalkeeper"].copy()
         if outfield_df.empty:
-            outfield_df = player_df.copy()
+            outfield_df = team_df.copy()
 
         total_goals = outfield_df["Goals"].sum()
         total_assists = outfield_df["Assists"].sum()
@@ -213,22 +250,21 @@ def display_player_predictions(team_name, league_id, expected_team_goals):
         else:
             outfield_df['Assist Prob (%)'] = 0.0
 
-        # Highest rated outfield player gets Star Player title
+        # Select top outfield Star Player by rating
         star_player = outfield_df.sort_values(by="Rating", ascending=False).iloc[0]
-        st.markdown(f"⭐ **Star Player:** **{star_player['Player']}** ({star_player['Position']} - Avg Rating: **{star_player['Rating']}/10**)")
+        st.markdown(f"⭐ **Star Player:** **{star_player['Player']}** ({star_player['Position']} - Rating: **{star_player['Rating']}/10**)")
 
-        # Display Top 5 attackers/playmakers based on goal contributions and ratings
+        # Display Top 5 outfield goal targets
         outfield_df["Rank_Score"] = outfield_df["Goals"] * 2 + outfield_df["Assists"] + outfield_df["Rating"]
         top_targets = outfield_df.sort_values(by="Rank_Score", ascending=False).head(5)
-        display_df = top_targets[["Player", "Position", "Scoring Prob (%)", "Assist Prob (%)"]]
 
         st.dataframe(
-            display_df.style.format({'Scoring Prob (%)': '{:.1f}%', 'Assist Prob (%)': '{:.1f}%'}),
+            top_targets[["Player", "Position", "Scoring Prob (%)", "Assist Prob (%)"]].style.format({'Scoring Prob (%)': '{:.1f}%', 'Assist Prob (%)': '{:.1f}%'}),
             hide_index=True
         )
         return
 
-    st.info("💡 Add your API-Football Key to load real player names & live ratings.")
+    st.info("Player data updating... Ensure GitHub Action workflow has completed or API Key is set.")
 
 
 # --- Streamlit UI ---
@@ -250,7 +286,7 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
         probs, p_matrix = predict_match(df, home_team, away_team)
 
         st.subheader(f"{home_team} vs {away_team}")
-        
+
         c1, c2, c3 = st.columns(3)
         c1.metric("Home Win", f"{probs['Home Win'] * 100:.1f}%")
         c2.metric("Draw", f"{probs['Draw'] * 100:.1f}%")
@@ -261,7 +297,7 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
 
         st.divider()
 
-        # Head to Head (Last 2 Meetings)
+        # Head to Head
         st.write("### 📜 Head-to-Head (Last 2 Meetings)")
         h2h_df = get_h2h_matches(df, home_team, away_team)
         if h2h_df is not None and not h2h_df.empty:
@@ -271,16 +307,16 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
 
         st.divider()
 
-        # Real Player Predictions via API-Football
+        # Key Player Predictions & Star Players
         st.write("### 👟 Key Player Predictions & Star Players")
         league_id = LEAGUES_CONFIG[selected_league]["api_league_id"]
 
-        with st.spinner("Fetching real player ratings from API-Football..."):
+        with st.spinner("Loading squad ratings and predictions..."):
             col_h, col_a = st.columns(2)
             with col_h:
                 st.write(f"**{home_team} Targets**")
                 display_player_predictions(home_team, league_id, probs['Expected Home Goals'])
-                
+
             with col_a:
                 st.write(f"**{away_team} Targets**")
                 display_player_predictions(away_team, league_id, probs['Expected Away Goals'])
@@ -300,7 +336,7 @@ if df is not None and all(c in df.columns for c in ['HomeTeam', 'AwayTeam']):
         for h in range(6):
             for a in range(6):
                 scores.append({'Score': f"{home_team} {h} - {a} {away_team}", 'Probability': p_matrix[h, a] * 100})
-        
+
         top_scores_df = pd.DataFrame(scores).sort_values(by='Probability', ascending=False).head(5)
         st.bar_chart(top_scores_df.set_index('Score'))
 
